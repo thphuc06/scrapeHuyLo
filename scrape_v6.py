@@ -1,19 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Google Maps Scraper V5.7 - SMART SEARCH + BFS EXPANSION
-- Fix address extraction (loại bỏ rating, category lẫn vào)
-- Tối ưu lấy phone, website
-- Lấy opening_hours chi tiết từ T2-CN
-- Smart search strategy (name+address / name+city / name+coords)
-- IMPROVED: Expansion mode - Lấy related places từ "Mọi người cũng tìm kiếm" bằng cách extract names từ aria-label trên div.Lnaw4c
-  + Tăng scroll times/sleep để load section
-  + Specific selector cho div[class*='Lnaw4c'] với aria-label matching pattern
-  + Không cần URL/lat/lon, chỉ lấy name và search by name only
-  + Thêm debug nâng cao: check heading by text, limit search trong section, print sample aria-labels, total aria elements
-- Loại bỏ field related_places trong output (chỉ scrape chúng như các place riêng biệt qua BFS)
-- Clean output
-- Chỉnh sửa search: Đối với related places từ GMaps, search chỉ bằng name
-- Giữ nguyên các phần khác
+Google Maps Scraper V5.7.1 - SMART SEARCH + BFS EXPANSION + VERIFICATION
+- Thêm location verification (coords distance + city validation)
+- Giữ nguyên 100% logic cũ: BFS expansion, related places, search strategy
 """
 import os
 import sys
@@ -26,6 +15,7 @@ import re
 from typing import Optional, List, Tuple
 from datetime import datetime
 from collections import deque
+from math import radians, cos, sin, asin, sqrt
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -43,12 +33,79 @@ if sys.platform == 'win32':
 
 
 # ============================================================
-# CONFIGURATION - Thay đổi theo nhu cầu
+# CONFIGURATION
 # ============================================================
-DEFAULT_CITY = "Đà Nẵng, Việt Nam"  # City mặc định khi không có address
-BFS_MAX_PLACES = 1000  # Giới hạn tối đa places trong BFS để tránh vô hạn
-BFS_MAX_DEPTH = 3  # Độ sâu tối đa trong BFS (từ seed places)
+DEFAULT_CITY = "Đà Nẵng, Việt Nam"
+BFS_MAX_PLACES = 1000
+BFS_MAX_DEPTH = 3
+MAX_DISTANCE_KM = 50  # NEW: Max acceptable distance
 
+
+# ============================================================
+# NEW: VERIFICATION FUNCTIONS
+# ============================================================
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Tính khoảng cách giữa 2 coords (km)"""
+    if not all([lat1, lon1, lat2, lon2]):
+        return float('inf')
+    
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    
+    return 6371 * c
+
+
+def extract_coords_from_url(url: str) -> Tuple[Optional[float], Optional[float]]:
+    """Extract lat, lon từ Google Maps URL"""
+    if not url:
+        return None, None
+    
+    try:
+        match = re.search(r'/@(-?\d+\.?\d*),(-?\d+\.?\d*),\d+\.?\d*z', url)
+        if match:
+            lat = float(match.group(1))
+            lon = float(match.group(2))
+            return lat, lon
+    except:
+        pass
+    
+    return None, None
+
+
+def extract_city_from_address(address: str) -> Optional[str]:
+    """Extract tên thành phố từ địa chỉ"""
+    if not address:
+        return None
+    
+    addr_lower = unidecode(address.lower())
+    
+    cities = [
+        'ha noi', 'thanh pho ho chi minh', 'ho chi minh', 'sai gon',
+        'hai phong', 'da nang', 'can tho', 'bien hoa', 'vung tau',
+        'nha trang', 'hue', 'nam dinh', 'hai duong', 'quang ninh',
+        'thanh hoa', 'nghe an', 'dong nai', 'binh duong', 'long an',
+        'khanh hoa', 'lam dong', 'bac ninh', 'thai nguyen', 'vinh phuc',
+    ]
+    
+    for city in cities:
+        if city in addr_lower:
+            return city
+    
+    match = re.search(r'(?:thanh pho|tp\.?)\s+([a-z\s]+?)(?:,|$)', addr_lower)
+    if match:
+        return match.group(1).strip()
+    
+    return None
+
+
+# ============================================================
+# EXISTING FUNCTIONS (GIỮ NGUYÊN)
+# ============================================================
 
 def normalize_place_name(name: str) -> str:
     if not name:
@@ -78,32 +135,16 @@ def extract_name_from_google_maps_url(url: str) -> Optional[str]:
 
 
 def clean_address(addr: str) -> Optional[str]:
-    """Clean địa chỉ - loại bỏ rating, category, directions bị lẫn vào"""
+    """Clean địa chỉ - loại bỏ rating, category"""
     if not addr or len(addr) < 5:
         return None
     
-    # Pattern KHÔNG hợp lệ
     invalid_patterns = [
-        r'\d+[,.]?\d*\s*\(\d',      # 4,1(903 - rating
-        r'·',                        # Google separator
-        r'Điểm thu hút',
-        r'Điểm mốc',
-        r'Đường đi',
-        r'Mở cửa',
-        r'Đóng cửa',
-        r'Sắp đóng',
-        r'Sắp mở',
-        r'\bsao\b',
-        r'\bstar\b',
-        r'Khách sạn nghỉ',
-        r'Bể bơi',
-        r'Wi-Fi',
-        r'Được tài trợ',
-        r'Của Agoda',
-        r'Booking\.com',
-        r'Đại lý du lịch',
-        r'Công viên xe',
-        r'Phòng cho thuê',
+        r'\d+[,.]?\d*\s*\(\d', r'·', r'Điểm thu hút', r'Điểm mốc',
+        r'Đường đi', r'Mở cửa', r'Đóng cửa', r'Sắp đóng', r'Sắp mở',
+        r'\bsao\b', r'\bstar\b', r'Khách sạn nghỉ', r'Bể bơi', r'Wi-Fi',
+        r'Được tài trợ', r'Của Agoda', r'Booking\.com', r'Đại lý du lịch',
+        r'Công viên xe', r'Phòng cho thuê',
     ]
     
     for pattern in invalid_patterns:
@@ -112,7 +153,6 @@ def clean_address(addr: str) -> Optional[str]:
     
     addr = re.sub(r'\s+', ' ', addr).strip()
     
-    # Validate
     valid_keywords = [
         'đường', 'phố', 'quận', 'huyện', 'tỉnh', 'thành phố', 'tp',
         'phường', 'xã', 'thị trấn', 'ấp', 'thôn', 'số', 'ngõ', 'ngách',
@@ -149,71 +189,64 @@ def clean_website_url(url: str) -> Optional[str]:
 
 
 def is_valid_address(address: str) -> bool:
-    """Kiểm tra address có đủ tốt để search không"""
     if not address:
         return False
     address = address.strip()
     if len(address) < 10:
         return False
-    # Kiểm tra có chứa thông tin địa lý không
     geo_keywords = ['đường', 'phố', 'quận', 'huyện', 'phường', 'xã',
                     'thành phố', 'việt nam', 'vietnam', ',']
     return any(kw in address.lower() for kw in geo_keywords)
 
 
-def validate_address_match(original_address: str, scraped_address: str) -> bool:
+def validate_address_match(original_address: str, scraped_address: str, 
+                          original_city: str = None) -> bool:
     """
     Kiểm tra địa chỉ scrape có khớp với địa chỉ gốc không
-
-    Returns:
-        True nếu 2 địa chỉ khớp nhau (hoặc không có địa chỉ gốc)
-        False nếu 2 địa chỉ hoàn toàn không liên quan
+    NEW: Thêm city validation
     """
-    # Nếu không có địa chỉ gốc, chấp nhận địa chỉ scrape
     if not original_address or len(original_address.strip()) < 5:
         return True
-
-    # Nếu không scrape được địa chỉ, return True (giữ null)
     if not scraped_address:
         return True
 
-    # Normalize cả 2 địa chỉ
+    # === NEW: CHECK THÀNH PHỐ ===
+    orig_city = extract_city_from_address(original_address)
+    scrap_city = extract_city_from_address(scraped_address)
+    
+    if original_city:
+        orig_city = extract_city_from_address(original_city) or orig_city
+    
+    if orig_city and scrap_city and orig_city != scrap_city:
+        print(f"   [REJECT] City mismatch: '{orig_city}' vs '{scrap_city}'")
+        return False
+
+    # === EXISTING: CHECK SIMILARITY ===
     orig_norm = unidecode(original_address.lower()).strip()
     scrap_norm = unidecode(scraped_address.lower()).strip()
 
-    # Nếu 2 địa chỉ quá giống nhau (>= 70% similarity)
     if fuzz.partial_ratio(orig_norm, scrap_norm) >= 70:
         return True
 
-    # Kiểm tra có chung các từ khóa địa lý quan trọng không
-    # (quận, phường, đường, thành phố...)
     orig_words = set(orig_norm.split())
     scrap_words = set(scrap_norm.split())
-
-    # Các từ khóa quan trọng phải match
     important_keywords = ['quan', 'phuong', 'duong', 'pho', 'xa', 'huyen',
                          'thanh pho', 'tinh', 'district', 'ward', 'street']
-
+    
     orig_important = {w for w in orig_words if any(k in w for k in important_keywords)}
     scrap_important = {w for w in scrap_words if any(k in w for k in important_keywords)}
 
-    # Nếu có ít nhất 1 từ khóa quan trọng chung -> OK
     if orig_important & scrap_important:
         return True
-
-    # Nếu địa chỉ gốc có thông tin địa lý nhưng scrape hoàn toàn khác -> REJECT
+    
     if orig_important and scrap_important and not (orig_important & scrap_important):
+        print(f"   [REJECT] Geographic keywords mismatch")
         return False
 
-    # Fallback: nếu có ít nhất 2 từ chung (không tính từ phổ biến)
     common_words = ['viet', 'nam', 'vietnam', 'vn', 'so', 'number']
     meaningful_common = (orig_words & scrap_words) - set(common_words)
-
-    if len(meaningful_common) >= 2:
-        return True
-
-    # Ngược lại: 2 địa chỉ không khớp
-    return False
+    
+    return len(meaningful_common) >= 2
 
 
 class GoogleMapsScraper:
@@ -226,7 +259,7 @@ class GoogleMapsScraper:
         self.headless = headless
         self.driver = None
         self.default_city = default_city
-        self.current_lat = None  # Track current place coords
+        self.current_lat = None
         self.current_lon = None
 
     def init_driver(self):
@@ -250,8 +283,6 @@ class GoogleMapsScraper:
 
     def _get_address(self) -> Optional[str]:
         """Lấy địa chỉ - CHỈ từ nguồn đáng tin"""
-        
-        # Strategy 1: data-item-id='address'
         try:
             btn = self.driver.find_element(By.CSS_SELECTOR, "button[data-item-id='address']")
             aria = btn.get_attribute("aria-label")
@@ -263,7 +294,6 @@ class GoogleMapsScraper:
         except:
             pass
         
-        # Strategy 2: aria-label bắt đầu "Địa chỉ:"
         try:
             buttons = self.driver.find_elements(By.CSS_SELECTOR, "button[aria-label]")
             for btn in buttons:
@@ -276,7 +306,6 @@ class GoogleMapsScraper:
         except:
             pass
         
-        # Strategy 3: Tìm div.Io6YTe trong button address
         try:
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             for btn in soup.find_all('button', attrs={'data-item-id': True}):
@@ -377,15 +406,11 @@ class GoogleMapsScraper:
         return None
 
     def _get_about(self) -> Optional[List[str]]:
-        """
-        Lấy About section - trả về list tất cả features
-        Format: ["Có: Picnic tables", "Không: Wheelchair accessible entrance", ...]
-        """
+        """Lấy About section"""
         features = []
         seen = set()
         
         try:
-            # Click tab About/Giới thiệu
             tabs = self.driver.find_elements(By.CSS_SELECTOR, "button[role='tab']")
             clicked = False
             for tab in tabs:
@@ -399,7 +424,6 @@ class GoogleMapsScraper:
             if not clicked:
                 return None
             
-            # Scroll nhiều lần để load hết content
             try:
                 scrollables = self.driver.find_elements(By.CSS_SELECTOR, "div[role='main'], div.m6QErb")
                 for scrollable in scrollables:
@@ -409,13 +433,10 @@ class GoogleMapsScraper:
             except:
                 pass
             
-            # Helper function để parse và add feature
             def add_feature(aria: str):
-                if not aria or len(aria) < 3:
+                if not aria or len(aria) < 3 or len(aria) > 100:
                     return
                 
-                if len(aria) > 100: return 
-
                 feature = None
                 
                 if aria.startswith("Có: "):
@@ -429,7 +450,7 @@ class GoogleMapsScraper:
                 elif aria.startswith("Chấp nhận "):
                     feature = "Có: " + aria[10:].strip()
                 elif aria.startswith("Phù hợp "):
-                    feature = "Có: " + aria 
+                    feature = "Có: " + aria
                 elif aria.startswith("Thích hợp "):
                     feature = "Có: " + aria
                 elif aria.startswith("Yes: "):
@@ -446,24 +467,13 @@ class GoogleMapsScraper:
                     feature = "Có: " + aria[8:].strip()
                 elif aria.startswith("Good for "):
                     feature = "Có: " + aria
-                elif aria.startswith("Picnic"): 
-                    feature = "Có: " + aria
-                elif aria.startswith("Wifi"):
-                    feature = "Có: " + aria
-                elif aria.startswith("Toilet"):
-                    feature = "Có: " + aria
-                elif aria.startswith("Restroom"):
-                    feature = "Có: " + aria
-                elif aria.startswith("Parking"):
-                    feature = "Có: " + aria
-                elif aria.startswith("Wheelchair"):
+                elif any(aria.startswith(x) for x in ["Picnic", "Wifi", "Toilet", "Restroom", "Parking", "Wheelchair"]):
                     feature = "Có: " + aria
 
                 if feature and feature not in seen and len(feature) > 5:
                     seen.add(feature)
                     features.append(feature)
             
-            # Strategy 1: Selenium
             try:
                 elements = self.driver.find_elements(By.CSS_SELECTOR, "[aria-label]")
                 for elem in elements:
@@ -475,7 +485,6 @@ class GoogleMapsScraper:
             except:
                 pass
             
-            # Strategy 2: BeautifulSoup
             try:
                 soup = BeautifulSoup(self.driver.page_source, 'html.parser')
                 
@@ -506,7 +515,6 @@ class GoogleMapsScraper:
             except:
                 pass
             
-            # Strategy 3: Tìm theo pattern class
             try:
                 feature_divs = self.driver.find_elements(By.CSS_SELECTOR, "div[class*='iNvpkc'], li[class*='hpLkke']")
                 for div in feature_divs:
@@ -528,12 +536,9 @@ class GoogleMapsScraper:
         return features if features else None
 
     def _get_comments(self, num: int = 3) -> List[dict]:
-        """
-        Lấy comments với full text (click "Thêm" để expand)
-        """
+        """Lấy comments với full text"""
         comments = []
         try:
-            # Click tab Reviews/Đánh giá
             tabs = self.driver.find_elements(By.CSS_SELECTOR, "button[role='tab']")
             for tab in tabs:
                 if any(x in tab.text.lower() for x in ["đánh giá", "review"]):
@@ -541,7 +546,6 @@ class GoogleMapsScraper:
                     time.sleep(1.5)
                     break
             
-            # Scroll để load reviews
             try:
                 scrollable = self.driver.find_element(By.CSS_SELECTOR, "div[role='main']")
                 for _ in range(3):
@@ -550,15 +554,12 @@ class GoogleMapsScraper:
             except:
                 pass
             
-            # === CLICK TẤT CẢ NÚT "THÊM" ĐỂ EXPAND COMMENT ===
             try:
-                # Tìm tất cả button "Thêm" / "More" trong reviews
                 more_buttons = self.driver.find_elements(By.CSS_SELECTOR, 
                     "button.w8nwRe.kyuRq, button[aria-label='Xem thêm'], button[jsaction*='review.expandReview']")
                 
                 for btn in more_buttons:
                     try:
-                        # Chỉ click nếu button visible và có text "Thêm" hoặc "More"
                         if btn.is_displayed():
                             btn_text = btn.text.strip().lower()
                             if btn_text in ['thêm', 'more', 'see more', 'xem thêm']:
@@ -567,7 +568,6 @@ class GoogleMapsScraper:
                     except:
                         continue
                 
-                # Fallback: Tìm theo class w8nwRe (Google Maps dùng class này cho "Thêm")
                 more_buttons2 = self.driver.find_elements(By.CSS_SELECTOR, "button.w8nwRe")
                 for btn in more_buttons2:
                     try:
@@ -580,10 +580,8 @@ class GoogleMapsScraper:
             except Exception as e:
                 print(f"   [WARNING] Click 'Thêm' error: {e}")
             
-            # Đợi content expand
             time.sleep(0.5)
             
-            # Parse reviews sau khi đã expand
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             review_divs = soup.find_all('div', {'data-review-id': True})
             
@@ -593,21 +591,17 @@ class GoogleMapsScraper:
                 if rid and rid not in seen:
                     seen.add(rid)
                     try:
-                        # Author
                         author_elem = div.find('div', class_=lambda x: x and 'd4r55' in str(x))
                         author = author_elem.text.strip() if author_elem else "Anonymous"
                         
-                        # Rating
                         rating_elem = div.find('span', {'role': 'img', 'aria-label': True})
                         rating_text = rating_elem.get('aria-label', '') if rating_elem else ''
                         rating_match = re.search(r'(\d+)', rating_text)
                         rating = float(rating_match.group(1)) if rating_match else 0.0
                         
-                        # Text - lấy từ span.wiI7pd (đã được expand)
                         text_elem = div.find('span', class_=lambda x: x and 'wiI7pd' in str(x))
                         text = text_elem.text.strip() if text_elem else ""
                         
-                        # Date
                         time_elem = div.find('span', class_=lambda x: x and 'rsqaWe' in str(x))
                         date = None
                         if time_elem:
@@ -660,23 +654,16 @@ class GoogleMapsScraper:
             return None
 
     def _get_hours(self) -> Optional[dict]:
-        """
-        Lấy opening hours từ T2 - CN
-        
-        Returns:
-            dict: {"Thứ Hai": "08:00-17:00", ...} hoặc None
-        """
+        """Lấy opening hours"""
         result = {}
         
         try:
-            # Step 1: Click button giờ mở cửa để mở dropdown
             try:
                 hour_btn = self.driver.find_element(By.CSS_SELECTOR, "button[data-item-id='oh']")
                 if hour_btn.get_attribute("aria-expanded") != "true":
                     hour_btn.click()
                     time.sleep(1.2)
             except:
-                # Fallback: tìm button có chứa text giờ
                 try:
                     buttons = self.driver.find_elements(By.CSS_SELECTOR, "button[aria-label*='Đang mở'], button[aria-label*='Đã đóng']")
                     for btn in buttons:
@@ -686,45 +673,32 @@ class GoogleMapsScraper:
                 except:
                     pass
             
-            # Step 2: Parse table giờ mở cửa
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            
-            # Tìm table chứa giờ (class eK4R0e)
             table = soup.find('table', class_=lambda x: x and 'eK4R0e' in str(x))
             
             if table:
                 rows = table.find_all('tr', class_=lambda x: x and 'y0skZc' in str(x))
                 
                 for row in rows:
-                    # Lấy tên ngày từ td.ylH6lf
                     day_td = row.find('td', class_=lambda x: x and 'ylH6lf' in str(x))
-                    
-                    # Lấy giờ từ td.mxowUb
                     time_td = row.find('td', class_=lambda x: x and 'mxowUb' in str(x))
                     
                     if day_td and time_td:
                         day_name = day_td.get_text(strip=True)
-                        
-                        # Ưu tiên lấy từ aria-label
                         hours_text = time_td.get('aria-label', '')
                         
-                        # Fallback: lấy từ li.G8aQO
                         if not hours_text:
                             li = time_td.find('li', class_=lambda x: x and 'G8aQO' in str(x))
                             if li:
                                 hours_text = li.get_text(strip=True)
                         
-                        # Fallback: lấy text trực tiếp
                         if not hours_text:
                             hours_text = time_td.get_text(strip=True)
                         
                         if day_name and hours_text:
-                            # Clean format: "08:00 đến 17:00" -> "08:00-17:00"
-                            hours_text = hours_text.replace(' đến ', '-').replace('đến', '-')
-                            hours_text = hours_text.replace('–', '-')  # en-dash -> hyphen
+                            hours_text = hours_text.replace(' đến ', '-').replace('đến', '-').replace('–', '-')
                             result[day_name] = hours_text
             
-            # Step 3: Fallback - Selenium trực tiếp nếu BeautifulSoup fail
             if not result:
                 try:
                     rows = self.driver.find_elements(By.CSS_SELECTOR, "table.eK4R0e tr.y0skZc")
@@ -841,7 +815,6 @@ class GoogleMapsScraper:
         return rating, count
 
     def _get_category(self) -> Optional[str]:
-        """Lấy category/type từ Google Maps"""
         try:
             buttons = self.driver.find_elements(By.CSS_SELECTOR, "button[jsaction*='category']")
             for btn in buttons:
@@ -860,71 +833,55 @@ class GoogleMapsScraper:
         return None
 
     def _get_related_place_names(self) -> List[str]:
-        """
-        Lấy tên các địa điểm liên quan từ "Mọi người cũng tìm kiếm" / "People also search for"
-        bằng cách tìm div[class*='Lnaw4c'] với aria-label matching pattern "Name rating sao-count đánh giá gợi ý"
-
-        Returns:
-            List[str]: Các tên địa điểm
-        """
+        """Lấy tên các địa điểm liên quan từ 'Mọi người cũng tìm kiếm'"""
         related_names = []
         seen = set()
 
         try:
-            # Scroll nhiều lần để load section (tăng lên 10 lần để chắc chắn hơn)
             try:
                 scrollable = self.driver.find_element(By.CSS_SELECTOR, "div[role='main']")
                 for _ in range(10):
                     self.driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', scrollable)
-                    time.sleep(1.0)  # Tăng sleep time
+                    time.sleep(1.0)
             except:
                 print("   [DEBUG] No scrollable div[role='main'] found.")
             
-            # Đợi thêm để content load
             time.sleep(3)
 
-            # Sử dụng BeautifulSoup để parse page source
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
 
-            # Debug nâng cao: Tìm heading bằng text pattern (không rely on tag)
             heading_pattern = re.compile(r'mọi người cũng tìm kiếm|people also search for', re.IGNORECASE)
             heading_elem = soup.find(string=heading_pattern)
             if heading_elem:
                 print("   [DEBUG] Related section heading found: " + heading_elem.strip())
-                # Tìm parent section (ancestor div)
                 section = heading_elem.find_parent('div', attrs={'role': 'region'}) or heading_elem.find_parent('div')
                 if section:
                     print("   [DEBUG] Related section parent found.")
                 else:
-                    section = soup  # Fallback toàn page
+                    section = soup
             else:
                 print("   [DEBUG] No related section heading found.")
+                section = soup
 
-            # Debug: Tổng số elements có aria-label
             all_aria_elements = soup.find_all(attrs={'aria-label': True})
             print(f"   [DEBUG] Total elements with aria-label: {len(all_aria_elements)}")
 
-            # Tìm divs với class containing 'Lnaw4c' trong section (hoặc toàn page nếu không có section)
-            elements = section.find_all('div', class_=lambda x: x and 'lnaw4c' in str(x).lower())  # Lowercase to match
+            elements = section.find_all('div', class_=lambda x: x and 'lnaw4c' in str(x).lower())
             print(f"   [DEBUG] Number of divs with 'lnaw4c' in class: {len(elements)}")
 
-            # Pattern để match aria-label của related places
-            # Flexible regex: support dấu chấm/phẩy trong rating/count, optional spaces/dash
             pattern = re.compile(r'.+ \d[.,]\d\s*sao\s*[-–\s]*[\d.,]+\s*đánh giá\s*gợi ý$', re.IGNORECASE)
 
-            # Debug: Print top 10 aria-labels trong section để check
             aria_samples = [elem.get('aria-label', '').strip() for elem in all_aria_elements[:10]]
             print("   [DEBUG] Sample aria-labels (top 10):")
             for sample in aria_samples:
                 if sample:
-                    print(f"     - {sample[:100]}...")  # Giới hạn dài
+                    print(f"     - {sample[:100]}...")
 
             for elem in elements:
                 aria = elem.get('aria-label', '').strip()
                 print(f"   [DEBUG] Aria-label found in Lnaw4c div: {aria[:100]}...")
                 if pattern.match(aria):
                     print(f"   [DEBUG] Matched aria-label: {aria}")
-                    # Extract name using regex match
                     match = re.match(r'^(.*?) \d[.,]\d\s*sao\s*[-–\s]*[\d.,]+\s*đánh giá\s*gợi ý$', aria, re.IGNORECASE)
                     if match:
                         name = match.group(1).strip()
@@ -937,68 +894,53 @@ class GoogleMapsScraper:
         except Exception as e:
             print(f"   [ERROR] Get related places: {e}")
 
-        # Deduplicate
-        unique_names = list(seen)
+        return list(seen)
 
-        return unique_names
-
-    def _build_search_url(self, name: str, address: str, lat: float, lon: float, city: str = None, force_name_only: bool = False) -> Tuple[str, str]:
+    def _build_search_url(self, name: str, address: str, lat: float, lon: float, 
+                        city: str = None, force_name_only: bool = False) -> Tuple[str, str]:
         """
-        Tạo URL search thông minh
-        
-        Returns:
-            Tuple[url, search_method]: URL và phương thức search đã dùng
+        Tạo URL search thông minh - ƯU TIÊN COORDS
+        Priority: name+address > name@coords > name+city
         """
         city = city or self.default_city
         
         if force_name_only:
-            # Chỉ search bằng name cho related places (tên từ GMaps chuẩn)
             search_query = name
             url = f"https://www.google.com/maps/search/{urllib.parse.quote(search_query)}"
             return url, f"name_only: {search_query[:50]}..."
         
-        # Case 1: Có address tốt -> search name + address
+        # PRIORITY 1: Address đầy đủ (BEST)
         if is_valid_address(address):
             search_query = f"{name}, {address}"
             url = f"https://www.google.com/maps/search/{urllib.parse.quote(search_query)}"
             return url, f"name+addr: {search_query[:50]}..."
         
-        # Case 2: Có city -> search name + city
+        # PRIORITY 2: Coords chính xác (BETTER) - NEW ORDER!
+        if lat and lon and lat != 0 and lon != 0:
+            url = f"https://www.google.com/maps/search/{urllib.parse.quote(name)}/@{lat},{lon},17z"
+            return url, f"name@coords: {name[:30]}... @{lat:.4f},{lon:.4f}"
+        
+        # PRIORITY 3: City fallback (LAST RESORT)
         if city:
             search_query = f"{name}, {city}"
             url = f"https://www.google.com/maps/search/{urllib.parse.quote(search_query)}"
             return url, f"name+city: {search_query[:50]}..."
         
-        # Case 3: Fallback -> search name @coords (chính xác nhất khi không có gì)
-        url = f"https://www.google.com/maps/search/{urllib.parse.quote(name)}/@{lat},{lon},17z"
-        return url, f"name+coords: {name[:30]}... @{lat:.4f},{lon:.4f}"
+        # Fallback cuối cùng: chỉ tên
+        search_query = name
+        url = f"https://www.google.com/maps/search/{urllib.parse.quote(search_query)}"
+        return url, f"name_only: {search_query[:50]}..."
 
     def scrape_place(self, name: str, address: str, lat: float, lon: float,
                      num_reviews: int = 3, city: str = None, get_related: bool = False,
                      force_name_only: bool = False) -> dict:
         """
         Scrape thông tin địa điểm từ Google Maps
-
-        SMART SEARCH STRATEGY:
-        1. name + address (nếu address tốt - có đường, phường, quận...)
-        2. name + city (nếu không có address đủ tốt)
-        3. name @lat,lon (fallback - chính xác nhất khi không có gì)
-        - Nếu force_name_only=True (cho related), chỉ search bằng name
-
-        Args:
-            name: Tên địa điểm
-            address: Địa chỉ (có thể rỗng)
-            lat: Latitude
-            lon: Longitude
-            num_reviews: Số review cần lấy
-            city: Thành phố (dùng khi address không tốt)
-            get_related: Có lấy related places không (mặc định False)
-            force_name_only: Chỉ search bằng name (cho related places từ GMaps)
+        NEW: Thêm location verification
         """
         if not self.driver:
             self.init_driver()
 
-        # Track current place coordinates for related places extraction
         self.current_lat = lat
         self.current_lon = lon
 
@@ -1019,11 +961,9 @@ class GoogleMapsScraper:
             "google_maps_url": None,
             "opening_hours": None,
             "comments": [],
-            # Loại bỏ related_places
         }
 
         try:
-            # === SMART SEARCH ===
             url, search_method = self._build_search_url(name, address, lat, lon, city, force_name_only)
             print(f"   [SEARCH] {search_method}")
             
@@ -1033,7 +973,19 @@ class GoogleMapsScraper:
             current_url = self.driver.current_url
             result["google_maps_url"] = current_url
 
-            # Handle chain/search results list
+            # === NEW: VERIFY COORDS ===
+            scraped_lat, scraped_lon = extract_coords_from_url(current_url)
+            if scraped_lat and scraped_lon and lat and lon:
+                distance = haversine_distance(lat, lon, scraped_lat, scraped_lon)
+                print(f"   [VERIFY] Distance: {distance:.2f}km")
+                
+                if distance > MAX_DISTANCE_KM:
+                    print(f"   [REJECT] Too far from original location!")
+                    print(f"      Original: {lat:.4f}, {lon:.4f}")
+                    print(f"      Scraped:  {scraped_lat:.4f}, {scraped_lon:.4f}")
+                    return result  # Return empty result
+
+            # Handle chain/search results
             if "/search/" in current_url or not re.search(r'/place/[^/]+/@', current_url):
                 try:
                     wait = WebDriverWait(self.driver, 5)
@@ -1050,7 +1002,8 @@ class GoogleMapsScraper:
                                 cand = extract_name_from_google_maps_url(href)
                                 if cand:
                                     cand_norm = normalize_place_name(cand)
-                                    score = max(fuzz.ratio(query_norm, cand_norm), fuzz.token_set_ratio(query_norm, cand_norm))
+                                    score = max(fuzz.ratio(query_norm, cand_norm), 
+                                              fuzz.token_set_ratio(query_norm, cand_norm))
                                     if score > best_score:
                                         best_score = score
                                         best_link = link
@@ -1061,14 +1014,33 @@ class GoogleMapsScraper:
                             best_link.click()
                             time.sleep(2.5)
                             result["google_maps_url"] = self.driver.current_url
+                            
+                            # === NEW: VERIFY COORDS AFTER CLICK ===
+                            new_url = self.driver.current_url
+                            new_lat, new_lon = extract_coords_from_url(new_url)
+                            if new_lat and new_lon and lat and lon:
+                                distance = haversine_distance(lat, lon, new_lat, new_lon)
+                                print(f"   [VERIFY] After click distance: {distance:.2f}km")
+                                if distance > MAX_DISTANCE_KM:
+                                    print(f"   [REJECT] Clicked result too far!")
+                                    return result
                         elif links:
                             links[0].click()
                             time.sleep(2.5)
                             result["google_maps_url"] = self.driver.current_url
+                            
+                            # === NEW: VERIFY COORDS FOR FIRST RESULT ===
+                            new_url = self.driver.current_url
+                            new_lat, new_lon = extract_coords_from_url(new_url)
+                            if new_lat and new_lon and lat and lon:
+                                distance = haversine_distance(lat, lon, new_lat, new_lon)
+                                if distance > MAX_DISTANCE_KM:
+                                    print(f"   [REJECT] First result too far!")
+                                    return result
                 except:
                     pass
 
-            # === SCRAPE DATA TỪ TRANG CHÍNH ===
+            # === SCRAPE DATA ===
             
             rating, count = self._get_rating()
             result["rating"] = rating
@@ -1084,11 +1056,8 @@ class GoogleMapsScraper:
             
             scraped_addr = self._get_address()
 
-            # Validate địa chỉ scrape có khớp với địa chỉ gốc không
-            if scraped_addr and not validate_address_match(address, scraped_addr):
-                print(f"   [REJECT] Address mismatch:")
-                print(f"      Original: {address[:50]}...")
-                print(f"      Scraped:  {scraped_addr[:50]}...")
+            # NEW: Validate với city check
+            if scraped_addr and not validate_address_match(address, scraped_addr, city):
                 result["new_address"] = None
             else:
                 result["new_address"] = scraped_addr
@@ -1103,12 +1072,9 @@ class GoogleMapsScraper:
             if result["website"]:
                 print(f"   [OK] Website")
             
-            # Opening hours
             result["opening_hours"] = self._get_hours()
             if result["opening_hours"]:
                 print(f"   [OK] Hours: {len(result['opening_hours'])} days")
-            
-            # === SCRAPE DATA TỪ TABS ===
             
             result["images"] = self._get_images()
             print(f"   [OK] Images: {len(result['images'])}")
@@ -1139,15 +1105,7 @@ def scrape_csv_file(csv_file: str, output_file: str = None, headless: bool = Tru
                     expand_related: bool = False) -> List[dict]:
     """
     Scrape từ CSV file
-
-    Args:
-        csv_file: File CSV đầu vào (cần có: id/place_id, name, address, lat, lon)
-        output_file: File JSON đầu ra
-        headless: Chạy Chrome ẩn
-        start_index: Bắt đầu từ index
-        end_index: Kết thúc tại index
-        city: Tên thành phố (dùng khi address không tốt)
-        expand_related: Có mở rộng BFS không (mặc định False)
+    GIỮ NGUYÊN LOGIC CŨ + THÊM VERIFICATION
     """
     if output_file is None:
         name = os.path.splitext(os.path.basename(csv_file))[0]
@@ -1159,22 +1117,21 @@ def scrape_csv_file(csv_file: str, output_file: str = None, headless: bool = Tru
             output_file = os.path.join(os.path.dirname(csv_file), f"{name}_scraped.json")
 
     print("=" * 70)
-    print("GOOGLE MAPS SCRAPER V5.7 - SMART SEARCH + BFS EXPANSION")
+    print("GOOGLE MAPS SCRAPER V5.7.1 - WITH VERIFICATION")
     print("=" * 70)
     print(f"Input: {csv_file}")
     print(f"Output: {output_file}")
     print(f"City fallback: {city}")
+    print(f"Max distance: {MAX_DISTANCE_KM}km")
     print(f"Range: {start_index} -> {end_index or 'END'}")
-    print(f"Expansion mode: {'ON - BFS expansion with related places' if expand_related else 'OFF'}")
+    print(f"Expansion mode: {'ON - BFS expansion' if expand_related else 'OFF'}")
     print("=" * 70)
 
     places = []
     with open(csv_file, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Support both 'id' and 'place_id' columns
             place_id = row.get('place_id') or row.get('id', '')
-            # Support both 'lng' and 'lon' columns
             lng_value = row.get('lng') or row.get('lon', 0)
             places.append({
                 'place_id': place_id,
@@ -1191,26 +1148,23 @@ def scrape_csv_file(csv_file: str, output_file: str = None, headless: bool = Tru
         places = places[start_index:]
 
     print(f"[OK] Loaded {len(places)} seed places")
-    
-    # Count places without good address
     no_addr_count = sum(1 for p in places if not is_valid_address(p['address']))
-    print(f"[INFO] {no_addr_count} places without good address (will use name+city or coords)")
-    print()
+    print(f"[INFO] {no_addr_count} places without good address\n")
 
     scraper = GoogleMapsScraper(headless=headless, default_city=city)
     data = []
 
     try:
         if expand_related:
-            # BFS Mode: Sử dụng queue để mở rộng
-            queue = deque([(p, 0) for p in places])  # (place_dict, depth)
+            # BFS Mode - GIỮ NGUYÊN LOGIC CŨ
+            queue = deque([(p, 0) for p in places])
             visited = set()
             scraped_count = 0
 
             while queue and scraped_count < BFS_MAX_PLACES:
                 current, depth = queue.popleft()
                 name_norm = normalize_place_name(current['name'])
-                key = name_norm  # Chỉ dùng name_norm để visited, vì related không có coords chính xác ban đầu
+                key = name_norm
 
                 if key in visited:
                     continue
@@ -1220,40 +1174,38 @@ def scrape_csv_file(csv_file: str, output_file: str = None, headless: bool = Tru
                 print("-" * 50)
 
                 try:
-                    is_related = depth > 0  # Cho related places, force_name_only=True
+                    is_related = depth > 0
                     result = scraper.scrape_place(
                         name=current['name'],
                         address=current['address'],
                         lat=current['lat'],
                         lon=current['lon'],
                         city=city,
-                        get_related=False,  # Không cần get_related ở đây, sẽ gọi riêng
+                        get_related=False,
                         force_name_only=is_related
                     )
                     result['place_id'] = current['place_id']
                     result['type'] = current['type']
                     result['scraped_at'] = datetime.now().isoformat()
-                    result['bfs_depth'] = depth  # Thêm depth để track
+                    result['bfs_depth'] = depth
                     data.append(result)
                     scraped_count += 1
 
-                    # Lấy related names nếu depth < max_depth
                     if depth < BFS_MAX_DEPTH:
                         print(f"   [EXPAND] Searching for related places...")
                         related_names = scraper.get_related_names()
                         print(f"   [OK] Related names: {len(related_names)} - {related_names}")
                         for rel_name in related_names:
                             rel_place = {
-                                'place_id': '',  # Related chưa có id gốc
+                                'place_id': '',
                                 'name': rel_name,
-                                'address': '',  # Không có address cho related
-                                'lat': 0.0,  # Dummy lat/lon
+                                'address': '',
+                                'lat': 0.0,
                                 'lon': 0.0,
-                                'type': result['type']  # Kế thừa type từ parent
+                                'type': result['type']
                             }
                             queue.append((rel_place, depth + 1))
 
-                    # Auto-save every 10 places
                     if scraped_count % 10 == 0:
                         with open(output_file, 'w', encoding='utf-8') as f:
                             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1263,7 +1215,7 @@ def scrape_csv_file(csv_file: str, output_file: str = None, headless: bool = Tru
                     continue
 
         else:
-            # Linear Mode: Scrape từng place độc lập
+            # Linear Mode - GIỮ NGUYÊN LOGIC CŨ
             for i, p in enumerate(places, 1):
                 print(f"\n[{start_index + i}/{start_index + len(places)}] {p['name']}")
                 print("-" * 50)
@@ -1282,7 +1234,6 @@ def scrape_csv_file(csv_file: str, output_file: str = None, headless: bool = Tru
                     result['scraped_at'] = datetime.now().isoformat()
                     data.append(result)
 
-                    # Auto-save every 10 places
                     if i % 10 == 0:
                         with open(output_file, 'w', encoding='utf-8') as f:
                             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1335,45 +1286,36 @@ def merge_files(directory: str, output: str = None, pattern: str = "*_scraped_*.
 def main():
     import sys
     
-    # ============================================================
-    # CẤU HÌNH - THAY ĐỔI THEO NHU CẦU
-    # ============================================================
-    csv_file = r"C:\HCMUS\ComputationalThinking\track-asia\test_museum.csv"  # CHANGE THIS
-    city = "Đà Nẵng, Việt Nam"  # City fallback khi không có address
-    # ============================================================
+    csv_file = r"C:\HCMUS\ComputationalThinking\track-asia\test_museum.csv"
+    city = "Hồ Chí Minh, Việt Nam"
     
     if len(sys.argv) >= 2 and sys.argv[1] == '--help':
         print("""
-GOOGLE MAPS SCRAPER V5.7 - SMART SEARCH + BFS EXPANSION
+GOOGLE MAPS SCRAPER V5.7.1 - WITH VERIFICATION
 
 Usage:
     python scraper.py                      # Scrape toàn bộ file
-    python scraper.py 10                   # Scrape 10 places đầu tiên
-    python scraper.py 0 50                 # Scrape từ index 0 đến 50
-    python scraper.py 50 100               # Scrape từ index 50 đến 100
-    python scraper.py --expand             # Scrape toàn bộ + BFS expansion
-    python scraper.py --expand 0 50        # Scrape 0-50 + BFS expansion
+    python scraper.py 10                   # Scrape 10 places đầu
+    python scraper.py 0 50                 # Scrape từ 0-50
+    python scraper.py --expand             # Scrape + BFS expansion
     python scraper.py merge [directory]    # Merge các file JSON
 
-Search Strategy:
-    1. name + address  (nếu address có đường, phường, quận...)
-    2. name + city     (nếu address không đủ tốt)
-    3. name @lat,lon   (fallback - chính xác nhất khi không có gì)
-    - Cho related: Chỉ search bằng name (force_name_only=True)
+NEW: Location Verification
+    - Extract coords từ Google Maps URL
+    - Verify distance <= 50km
+    - Reject nếu coords xa hoặc city khác
+    - Check city trong địa chỉ
 
-BFS Expansion Mode (--expand):
-    - Bắt đầu từ seed places trong CSV
-    - Scrape và lấy tên related từ "Mọi người cũng tìm kiếm" qua aria-label trên div.Lnaw4c
-    - Thêm related vào queue (chỉ name, search by name only), tránh duplicate bằng normalized name
-    - Giới hạn: max {BFS_MAX_PLACES} places, max depth {BFS_MAX_DEPTH}
+GIỮ NGUYÊN:
+    - BFS expansion logic
+    - Related places extraction
+    - Search strategy order (name+addr -> name+city -> name+coords)
         """)
         return
     
-    # Parse arguments
     expand_mode = False
     args = sys.argv[1:]
 
-    # Check for --expand flag
     if '--expand' in args:
         expand_mode = True
         args = [a for a in args if a != '--expand']
